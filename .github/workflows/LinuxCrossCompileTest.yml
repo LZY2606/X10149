@@ -1,0 +1,107 @@
+name: Linux cross compile tests
+
+on:
+  push:
+    paths-ignore:
+    - '.devcontainer/**'
+    - '.gitpod.yml'
+    - '.vscode/**'
+    - 'tests/**'
+  pull_request:
+    paths-ignore:
+    - '.devcontainer/**'
+    - '.gitpod.yml'
+    - '.vscode/**'
+    - 'tests/**'
+  schedule:
+    # Run against the last commit on the default branch on Friday at 9pm (UTC?)
+    - cron:  '0 21 * * 5'
+
+jobs:
+  pre_job:
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - id: skip_check
+        # https://github.com/marketplace/actions/skip-duplicate-actions
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          concurrent_skipping: 'same_content'
+          do_not_skip: '["pull_request", "workflow_dispatch", "schedule"]'
+
+  linux-cross:
+    needs: pre_job
+    if: needs.pre_job.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      # Continue running other jobs in the matrix even if one fails.
+      fail-fast: false
+      matrix:
+        platform:
+          - target: aarch64-unknown-linux-musl
+            rust-version: stable
+          - target: i686-unknown-linux-musl
+            rust-version: stable
+          - target: armv7-unknown-linux-musleabihf
+            rust-version: stable
+          # Platforms without AtomicU64 support.
+          - target: armv5te-unknown-linux-musleabi
+            rust-version: stable
+
+    steps:
+      - name: Checkout Moka
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.platform.rust-version }}
+          targets: ${{ matrix.platform.target }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Remove integration tests and force enable rustc_version crate
+        run: |
+          rm -rf tests
+          cargo remove --dev actix-rt
+          cat Cargo.toml
+
+      - run: cargo clean
+
+      - name: Run tests (sync feature)
+        run: |
+          cross test --release -F sync \
+            --target ${{ matrix.platform.target }}
+
+      - name: Run tests (future feature)
+        run: |
+          cross test --release -F future \
+            --target ${{ matrix.platform.target }}
+
+      - name: Run tests (sync feature, drop cache)
+        run: |
+          cross test --release -F sync \
+            --target ${{ matrix.platform.target }} \
+            --lib sync::cache::tests::ensure_gc_runs_when_dropping_cache -- --exact
+        env:
+          RUSTFLAGS: '--cfg run_flaky_tests'
+
+      - name: Run tests (future feature, drop value after eviction for future::Cache)
+        run: |
+          cross test --release -F future \
+            --target ${{ matrix.platform.target }} \
+            --lib future::cache::tests::drop_value_immediately_after_eviction -- --exact
+        env:
+          RUSTFLAGS: '--cfg run_flaky_tests'
+
+      - name: Run tests (future feature, drop cache for future::Cache)
+        run: |
+          cross test --release -F future \
+            --target ${{ matrix.platform.target }} \
+            --lib future::cache::tests::ensure_gc_runs_when_dropping_cache -- --exact
+        env:
+          RUSTFLAGS: '--cfg run_flaky_tests'
