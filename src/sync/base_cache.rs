@@ -3654,5 +3654,89 @@ mod tests {
             );
             assert!(adm_after, "K remains admitted because it was never evicted");
         }
+
+        // REGRESSION (stale `WriteOp` vs. new generation): a `WriteOp::Upsert`
+        // created for a retired `EntryInfo` must not corrupt the re-inserted
+        // (new-generation) entry of the same key. Deterministic: the stale op
+        // is held by the test and delivered only after evict + re-insert, so
+        // no timing or probabilistic loop is involved.
+        //
+        // This test FAILS if the `is_alive()` lifecycle gate in
+        // `handle_upsert` (and its mirror re-check in `handle_admit`) is
+        // removed: the stale op would then be admitted as an orphan policy
+        // node for the defunct `EntryInfo_A`, inflating `entry_count` and
+        // wedging the LRU deque (issue #590).
+        #[test]
+        fn stale_upsert_after_reinsert_cannot_corrupt_new_entry() {
+            use crate::Entry;
+
+            let cache = new_lru_cache();
+            let k: u32 = 0;
+            let hash_k = cache.hash(&k);
+
+            // t1: insert K (EntryInfo_A, entry_gen = 1) and admit it.
+            insert(&cache, k, 1);
+            run(&cache);
+            assert_eq!(cache.entry_count(), 1);
+
+            // t2: update K. The CHT now holds value 100 on EntryInfo_A
+            // (entry_gen = 2), but the resulting WriteOp A2 is HELD BACK,
+            // simulating an op stuck in a full write op channel.
+            let (stale_a2, _now) = cache.do_insert_with_hash(Arc::new(k), hash_k, 100);
+
+            // t3: invalidate K. EntryInfo_A is retired atomically with the
+            // CHT unlink; the Remove op is drained, de-admitting A.
+            queue_remove(&cache, k, hash_k);
+            run(&cache);
+            assert!(!cache.contains_key_with_hash(&k, hash_k));
+
+            // t4: re-insert K -> EntryInfo_B (a NEW generation of the key,
+            // entry_gen = 1), then update it so B's entry_gen (2) numerically
+            // collides with the stale op's gen. Per-entry generations are not
+            // unique across generations of a key; entry identity must come
+            // from the EntryInfo itself, not from the generation number.
+            insert(&cache, k, 2);
+            let (b2, _now) = cache.do_insert_with_hash(Arc::new(k), hash_k, 3);
+            cache.write_op_ch.send(b2).expect("send B2");
+            run(&cache);
+            assert_eq!(cache.entry_count(), 1);
+
+            // t5: the stale op for the OLD generation finally arrives.
+            cache.write_op_ch.send(stale_a2).expect("send stale A2");
+            run(&cache);
+
+            // The new-generation entry must be intact in the CHT.
+            assert!(cache.contains_key_with_hash(&k, hash_k));
+            assert_eq!(
+                cache
+                    .get_with_hash(&k, hash_k, false)
+                    .map(Entry::into_value),
+                Some(3),
+                "stale WriteOp must not replace or remove the new-generation entry"
+            );
+            // And it must not have been admitted as an orphan policy node.
+            assert_eq!(
+                cache.entry_count(),
+                1,
+                "stale WriteOp must not inflate the policy entry count"
+            );
+
+            // The cache must still converge to its capacity afterwards (no
+            // zombie node wedging the LRU deque; see issue #590).
+            for nk in 100u32..150 {
+                insert(&cache, nk, nk);
+                run(&cache);
+            }
+            let before = cache.entry_count();
+            for _ in 0..20 {
+                run(&cache);
+            }
+            assert_eq!(before, cache.entry_count());
+            assert!(
+                cache.entry_count() <= MAX,
+                "entry_count={} must converge to max_capacity={MAX}",
+                cache.entry_count()
+            );
+        }
     }
 }
