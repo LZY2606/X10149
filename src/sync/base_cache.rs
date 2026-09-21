@@ -2704,6 +2704,85 @@ mod tests {
     }
 
     #[test]
+    fn stale_upsert_from_retired_generation_cannot_admit_after_reinsert() {
+        use crate::common::concurrent::housekeeper::InnerSync;
+        use std::collections::hash_map::RandomState;
+        use std::time::Duration;
+
+        let (clock, mock) = Clock::mock();
+        let mut cache = BaseCache::<u32, u32>::new(
+            None,
+            Some(1),
+            None,
+            RandomState::default(),
+            None,
+            EvictionPolicy::lru(),
+            None,
+            ExpirationPolicy::default(),
+            HousekeeperConfig::default(),
+            false,
+            clock,
+        );
+        cache.reconfigure_for_testing();
+        let cache = cache;
+
+        let key = 7;
+        let hash = cache.hash(&key);
+
+        mock.increment(Duration::from_secs(1));
+        let (old_op, _) = cache.do_insert_with_hash(std::sync::Arc::new(key), hash, 10);
+        cache.write_op_ch.send(old_op.clone()).unwrap();
+        cache.inner.run_pending_tasks(None, 1, 10);
+        assert_eq!(cache.entry_count(), 1);
+
+        let old_gen = match old_op {
+            crate::common::concurrent::WriteOp::Upsert { entry_gen, .. } => entry_gen,
+            _ => panic!("expected an Upsert write op"),
+        };
+
+        let removed = cache
+            .remove_entry(&key, hash)
+            .expect("the first generation must be present in the CHT");
+        let mut deqs = cache.inner.deques.lock();
+        let mut timer_wheel = cache.inner.timer_wheel.lock();
+        let mut counters = super::EvictionCounters::new(1, 1);
+        super::Inner::<u32, u32, RandomState>::handle_remove(
+            &mut deqs,
+            &mut timer_wheel,
+            removed.entry,
+            None,
+            &mut counters,
+        );
+        drop(timer_wheel);
+        drop(deqs);
+        cache.inner.entry_count.store(0);
+        cache.inner.weighted_size.store(0);
+
+        mock.increment(Duration::from_secs(1));
+        let (new_op, _) = cache.do_insert_with_hash(std::sync::Arc::new(key), hash, 20);
+        let new_gen = match &new_op {
+            crate::common::concurrent::WriteOp::Upsert { entry_gen, .. } => *entry_gen,
+            _ => panic!("expected an Upsert write op"),
+        };
+        assert_eq!(old_gen, new_gen);
+
+        cache.write_op_ch.send(old_op).unwrap();
+        cache.write_op_ch.send(new_op).unwrap();
+        cache.inner.run_pending_tasks(None, 1, 10);
+
+        assert_eq!(
+            cache.get_with_hash_without_recording(
+                &key,
+                hash,
+                None as Option<&mut fn(&u32) -> bool>,
+            ),
+            Some(20)
+        );
+        assert_eq!(cache.entry_count(), 1);
+        assert_eq!(cache.weighted_size(), 1);
+    }
+
+    #[test]
     fn test_per_entry_expiration() {
         use super::InnerSync;
         use crate::{common::time::Clock, Entry, Expiry};
